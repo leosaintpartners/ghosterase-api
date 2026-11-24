@@ -7,29 +7,32 @@ import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI(title="GhostErase AI - MI-GAN Neural Inpainting Engine")
 
+# Crucial for W3C CORS: allow_credentials MUST be False when using wildcard or cross-origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
+    origin = request.headers.get("origin", "*")
     if request.method == "OPTIONS":
-        response = JSONResponse({"status": "ok"})
+        response = Response(status_code=200)
     else:
         try:
             response = await call_next(request)
         except Exception as e:
             response = JSONResponse({"error": str(e)}, status_code=500)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
@@ -61,14 +64,17 @@ def run_migan_inpaint(img_bgr, mask_u8):
     Executes true Modulated Inpainting GAN (MI-GAN v2) neural erasure
     using tight bounding-box cropping with contextual margin.
     Peak RAM: ~90 MB (safely below Render 512 MB ceiling).
+    Supports tiny corner watermarks up to large text stamps with forensic feathering.
     """
     h, w = img_bgr.shape[:2]
     ys, xs = np.where(mask_u8 > 20)
     if len(ys) == 0:
         return img_bgr
 
-    # Tight crop around watermark with 32px contextual margin
-    pad = 32
+    raw_h = int(ys.max() - ys.min())
+    raw_w = int(xs.max() - xs.min())
+    pad = max(48, int(max(raw_h, raw_w) * 0.4))
+
     y1 = max(0, int(ys.min()) - pad)
     y2 = min(h, int(ys.max()) + pad)
     x1 = max(0, int(xs.min()) - pad)
@@ -78,15 +84,15 @@ def run_migan_inpaint(img_bgr, mask_u8):
     crop_mask = mask_u8[y1:y2, x1:x2]
     ch, cw = crop_img.shape[:2]
 
-    # Ensure dimensions are multiples of 16 for GAN convolutional layers, max 512
+    # Multiple of 16, minimum 64 for GAN convolutional layers, maximum 512 for RAM safety
     max_dim = 512
     if max(ch, cw) > max_dim:
         scale = max_dim / max(ch, cw)
-        target_w = max(16, int(round(cw * scale / 16.0)) * 16)
-        target_h = max(16, int(round(ch * scale / 16.0)) * 16)
+        target_w = max(64, int(round(cw * scale / 16.0)) * 16)
+        target_h = max(64, int(round(ch * scale / 16.0)) * 16)
     else:
-        target_w = max(16, int(np.ceil(cw / 16.0)) * 16)
-        target_h = max(16, int(np.ceil(ch / 16.0)) * 16)
+        target_w = max(64, int(np.ceil(cw / 16.0)) * 16)
+        target_h = max(64, int(np.ceil(ch / 16.0)) * 16)
 
     proc_img = cv2.resize(crop_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
     proc_mask = cv2.resize(crop_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
@@ -99,7 +105,7 @@ def run_migan_inpaint(img_bgr, mask_u8):
     m_in = migan_mask[np.newaxis, np.newaxis, ...]
     im_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
 
-    # Neural GAN Inference (~0.4s)
+    # Neural GAN Inference
     out = migan_session.run(None, {'image': im_in, 'mask': m_in})
     out_rgb = np.transpose(out[0][0], (1, 2, 0))
     out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
@@ -107,10 +113,13 @@ def run_migan_inpaint(img_bgr, mask_u8):
     if (target_w, target_h) != (cw, ch):
         out_bgr = cv2.resize(out_bgr, (cw, ch), interpolation=cv2.INTER_CUBIC)
 
-    # Seamless composite strictly on watermark mask
+    # Forensic soft alpha feathering on mask boundary
+    mask_feathered = cv2.GaussianBlur(crop_mask, (5, 5), 1.2).astype(np.float32) / 255.0
+    alpha = np.expand_dims(mask_feathered, axis=2)
+    blended_crop = (out_bgr.astype(np.float32) * alpha + crop_img.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+
     result = img_bgr.copy()
-    crop_composite = np.where(crop_mask[:, :, np.newaxis] > 20, out_bgr, crop_img)
-    result[y1:y2, x1:x2] = crop_composite
+    result[y1:y2, x1:x2] = blended_crop
     return result
 
 @app.get("/")
