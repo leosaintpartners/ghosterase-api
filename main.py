@@ -4,6 +4,7 @@ import base64
 import cv2
 import numpy as np
 import onnxruntime as ort
+from huggingface_hub import hf_hub_download
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,21 +20,24 @@ app.add_middleware(
 )
 
 # Load MI-GAN Neural Model
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "migan_pipeline_v2.onnx")
 migan_session = None
 
 try:
-    if os.path.exists(MODEL_PATH):
-        print(f"[*] Loading MI-GAN Neural Engine from {MODEL_PATH}...")
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 2
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        migan_session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
-        print("[+] MI-GAN Neural Model Ready!")
+    local_path = os.path.join(os.path.dirname(__file__), "migan_pipeline_v2.onnx")
+    if os.path.exists(local_path):
+        model_path = local_path
     else:
-        print(f"[-] MI-GAN model not found at {MODEL_PATH}")
+        print("[*] Fetching MI-GAN Neural Model weights from Hub...")
+        model_path = hf_hub_download(repo_id="ravetools/watermark-remover", filename="migan_pipeline_v2.onnx")
+
+    print(f"[*] Initializing MI-GAN Neural Engine from {model_path}...")
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 2
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    migan_session = ort.InferenceSession(model_path, opts, providers=['CPUExecutionProvider'])
+    print("[+] MI-GAN Modulated Inpainting GAN v2 Ready in Cloud!")
 except Exception as e:
-    print(f"[-] Error loading MI-GAN: {e}")
+    print(f"[-] MI-GAN load warning: {e}")
     migan_session = None
 
 def run_migan_inpaint(img_bgr, mask_u8):
@@ -68,19 +72,19 @@ def run_migan_inpaint(img_bgr, mask_u8):
     else:
         out_bgr_textured = out_bgr
 
-    # Seamless composite
+    # Seamless composite strictly on watermark mask
     final_bgr = np.where(mask_u8[:, :, np.newaxis] > 20, out_bgr_textured, img_bgr)
     return final_bgr
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "GhostErase MI-GAN AI Engine"}
+    return {"status": "ok", "service": "GhostErase MI-GAN AI Cloud Engine"}
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "engine": "MI-GAN Modulated Inpainting GAN v2" if migan_session else "OpenCV Telea Fallback"
+        "engine": "MI-GAN Neural Inpainter (Active)" if migan_session else "C++ Telea Fallback"
     }
 
 @app.post("/api/inpaint")
@@ -112,7 +116,6 @@ async def inpaint_endpoint(request: Request):
         if mask_raw is None:
             return JSONResponse({"error": "Failed to decode mask"}, status_code=400)
 
-        # Convert mask to single channel 8-bit grayscale
         if len(mask_raw.shape) == 3 and mask_raw.shape[2] == 4:
             mask_gray = (mask_raw[:, :, 3] > 20).astype(np.uint8) * 255
         elif len(mask_raw.shape) == 3:
@@ -122,13 +125,13 @@ async def inpaint_endpoint(request: Request):
 
         _, mask_binary = cv2.threshold(mask_gray, 20, 255, cv2.THRESH_BINARY)
 
-        # Execute MI-GAN if available
+        # Run MI-GAN Neural Inpainter
         if migan_session is not None:
             try:
                 result_bgr = run_migan_inpaint(img_bgr, mask_binary)
-                engine_used = "MI-GAN Neural GAN"
+                engine_used = "MI-GAN Neural GAN (Zero Blur)"
             except Exception as migan_err:
-                print(f"MI-GAN run error, falling back: {migan_err}")
+                print(f"MI-GAN error, using fallback: {migan_err}")
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                 mask_dilated = cv2.dilate(mask_binary, kernel, iterations=1)
                 result_bgr = cv2.inpaint(img_bgr, mask_dilated, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
@@ -145,7 +148,7 @@ async def inpaint_endpoint(request: Request):
             return JSONResponse({"error": "Failed to encode output image"}, status_code=500)
 
         out_b64 = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("utf-8")
-        return {"result": out_b64, "engine": engine_used}
+        return {"result": out_b64, "image": out_b64, "engine": engine_used}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
