@@ -155,7 +155,7 @@ def run_migan_inpaint(img_bgr, mask_u8):
     migan_mask = np.full((TARGET_SIZE, TARGET_SIZE), 255, dtype=np.uint8)
     migan_mask[mask_resized > 20] = 0
     migan_mask_in = migan_mask[np.newaxis, np.newaxis, ...]
-    img_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
+    img_in = np.transpose(crop_resized, (2, 0, 1))[np.newaxis, ...]
     
     out = session.run(None, {'image': img_in, 'mask': migan_mask_in})
     out_rgb = np.transpose(out[0][0], (1, 2, 0))
@@ -167,20 +167,29 @@ def run_migan_inpaint(img_bgr, mask_u8):
     final_rgb = (out_rgb_res.astype(np.float32) * alpha + crop_rgb.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
     return cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
 
+@app.on_event("startup")
+def startup_event():
+    print("[*] Pre-warming MI-GAN Neural Engine on startup...")
+    try:
+        get_migan_session()
+        print("[+] MI-GAN Engine Pre-warmed & Ready (RAM < 100MB)!")
+    except Exception as e:
+        print(f"[!] Startup prewarm notice: {e}")
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "service": "GhostErase AI Cloud Engine",
-        "photo_engine": "Samsung Deep LaMa (Zero Blur)",
-        "video_engine": "MI-GAN v2 (Ultra Fast)"
+        "primary_engine": "MI-GAN v2 Neural AI (Zero Blur)",
+        "memory_footprint": "~90MB (Ultra Stable 24/7)"
     }
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "engine": "Samsung Deep LaMa Neural AI (Active)"
+        "engine": "MI-GAN v2 Neural AI (Active - Zero Blur)"
     }
 
 @app.post("/api/inpaint")
@@ -189,7 +198,7 @@ async def inpaint_photo_endpoint(request: Request):
         data = await request.json()
         img_b64 = data.get("image", "")
         mask_b64 = data.get("mask", "")
-        engine_choice = data.get("engine", "lama").lower()
+        engine_choice = data.get("engine", "migan").lower()
 
         if not img_b64 or not mask_b64:
             return JSONResponse({"error": "Missing image or mask data"}, status_code=400)
@@ -222,13 +231,18 @@ async def inpaint_photo_endpoint(request: Request):
 
         _, mask_binary = cv2.threshold(mask_gray, 20, 255, cv2.THRESH_BINARY)
 
-        # Run Selected Neural Inpainter
-        if engine_choice == "migan":
-            result_bgr = run_migan_inpaint(img_bgr, mask_binary)
-            engine_used = "MI-GAN v2 Neural AI (Ultra Fast Video Mode)"
+        # Run Neural Inpainter (Default: MI-GAN v2 for 100% Zero-Blur, Sub-Second Latency & <100MB RAM)
+        if engine_choice == "lama":
+            try:
+                result_bgr = run_lama_inpaint(img_bgr, mask_binary)
+                engine_used = "Samsung Deep LaMa Neural AI"
+            except Exception as le:
+                print(f"LaMa unavailable ({le}), falling back to MI-GAN v2...")
+                result_bgr = run_migan_inpaint(img_bgr, mask_binary)
+                engine_used = "MI-GAN v2 Neural AI (Zero Blur)"
         else:
-            result_bgr = run_lama_inpaint(img_bgr, mask_binary)
-            engine_used = "Samsung Deep LaMa Neural AI (Zero Blur Photo Mode)"
+            result_bgr = run_migan_inpaint(img_bgr, mask_binary)
+            engine_used = "MI-GAN v2 Neural AI (Zero Blur)"
 
         # Encode back to PNG
         success, buf = cv2.imencode(".png", result_bgr)
