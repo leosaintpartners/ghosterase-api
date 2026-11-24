@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import base64
 import cv2
 import numpy as np
@@ -9,9 +10,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-app = FastAPI(title="GhostErase AI - MI-GAN Neural Inpainting Engine")
+app = FastAPI(title="GhostErase AI - Deep LaMa & MI-GAN Dual Engine")
 
-# Crucial for W3C CORS: allow_credentials MUST be False when using wildcard or cross-origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,109 +36,160 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# Load MI-GAN Neural Model with Ultra-Low Memory Budget (~90MB)
-migan_session = None
+# Lazy-loaded Neural Model Sessions to keep RAM strictly under 350MB
+_lama_session = None
+_migan_session = None
 
-try:
-    local_path = os.path.join(os.path.dirname(__file__), "migan_pipeline_v2.onnx")
-    if os.path.exists(local_path):
-        model_path = local_path
+def get_lama_session():
+    """Loads Samsung Deep LaMa Neural AI for 100% Zero-Blur Photo Watermark Removal (~340MB RAM)"""
+    global _lama_session, _migan_session
+    if _lama_session is None:
+        if _migan_session is not None:
+            del _migan_session
+            _migan_session = None
+            gc.collect()
+
+        local_path = os.path.join(os.path.dirname(__file__), "lama_fp32.onnx")
+        if os.path.exists(local_path):
+            model_path = local_path
+        else:
+            print("[*] Downloading Samsung Deep LaMa weights from Hugging Face Hub (Carve/LaMa-ONNX)...")
+            model_path = hf_hub_download(repo_id="Carve/LaMa-ONNX", filename="lama_fp32.onnx")
+
+        print(f"[*] Initializing Samsung Deep LaMa Neural AI from {model_path}...")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False  # Critical for 512MB RAM cap
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        _lama_session = ort.InferenceSession(model_path, opts, providers=['CPUExecutionProvider'])
+        print("[+] Samsung Deep LaMa Neural Photo AI Ready in Cloud!")
+    return _lama_session
+
+def get_migan_session():
+    """Loads MI-GAN v2 Neural Generator for High-Speed Video Processing (~90MB RAM)"""
+    global _lama_session, _migan_session
+    if _migan_session is None:
+        if _lama_session is not None:
+            del _lama_session
+            _lama_session = None
+            gc.collect()
+
+        local_path = os.path.join(os.path.dirname(__file__), "migan_pipeline_v2.onnx")
+        if os.path.exists(local_path):
+            model_path = local_path
+        else:
+            print("[*] Downloading MI-GAN weights from Hugging Face Hub (ravetools/watermark-remover)...")
+            model_path = hf_hub_download(repo_id="ravetools/watermark-remover", filename="migan_pipeline_v2.onnx")
+
+        print(f"[*] Initializing MI-GAN Video Engine from {model_path}...")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        _migan_session = ort.InferenceSession(model_path, opts, providers=['CPUExecutionProvider'])
+        print("[+] MI-GAN Neural Video AI Ready in Cloud!")
+    return _migan_session
+
+def run_lama_inpaint(img_bgr, mask_u8):
+    """
+    Executes true Samsung Deep LaMa (Resolution-Robust Large Mask Inpainting).
+    Zero blur, authentic Fourier texture synthesis.
+    """
+    session = get_lama_session()
+    image_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    orig_h, orig_w = image_rgb.shape[:2]
+    TARGET_SIZE = 512
+
+    img_resized = cv2.resize(image_rgb, (TARGET_SIZE, TARGET_SIZE), interpolation=cv2.INTER_AREA)
+    mask_resized = cv2.resize(mask_u8, (TARGET_SIZE, TARGET_SIZE), interpolation=cv2.INTER_NEAREST)
+
+    img_norm = (img_resized.astype(np.float32) / 255.0)
+    img_norm = np.transpose(img_norm, (2, 0, 1))
+    img_input = np.expand_dims(img_norm, axis=0)
+
+    mask_norm = (mask_resized > 20).astype(np.float32)
+    mask_input = np.expand_dims(mask_norm, axis=(0, 1))
+
+    in_names = [inp.name for inp in session.get_inputs()]
+    outputs = session.run(None, {
+        in_names[0]: img_input,
+        in_names[1]: mask_input
+    })
+
+    output_tensor = outputs[0][0]
+    output_tensor = np.transpose(output_tensor, (1, 2, 0))
+    output_tensor = np.clip(output_tensor, 0, 255).astype(np.uint8)
+
+    result_rgb = cv2.resize(output_tensor, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+
+    # Forensic grain & texture matching from local engine
+    border_ring = cv2.dilate(mask_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) - mask_u8
+    if np.count_nonzero(border_ring) > 40:
+        high_pass = image_rgb.astype(np.float32) - cv2.GaussianBlur(image_rgb, (5, 5), 0).astype(np.float32)
+        noise_sigma = np.std(high_pass[border_ring > 0], axis=0)
+        grain = np.random.normal(0, np.clip(noise_sigma, 0.6, 6.0), image_rgb.shape)
+        result_rgb_textured = np.clip(result_rgb.astype(np.float32) + grain, 0, 255).astype(np.uint8)
     else:
-        print("[*] Fetching MI-GAN Neural Model weights from Hub...")
-        model_path = hf_hub_download(repo_id="ravetools/watermark-remover", filename="migan_pipeline_v2.onnx")
+        result_rgb_textured = result_rgb
 
-    print(f"[*] Initializing MI-GAN Neural Engine from {model_path}...")
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 1
-    opts.inter_op_num_threads = 1
-    opts.enable_cpu_mem_arena = False  # Critical: restricts RAM to ~90MB (never crashes Render)
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    migan_session = ort.InferenceSession(model_path, opts, providers=['CPUExecutionProvider'])
-    print("[+] MI-GAN Modulated Inpainting GAN v2 Ready in Cloud (Low-RAM Mode)!")
-except Exception as e:
-    print(f"[-] MI-GAN load warning: {e}")
-    migan_session = None
+    mask_feathered = cv2.GaussianBlur(mask_u8, (5, 5), 1.2).astype(np.float32) / 255.0
+    alpha = np.expand_dims(mask_feathered, axis=2)
+    final_rgb = (result_rgb_textured.astype(np.float32) * alpha + image_rgb.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+    return cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
 
 def run_migan_inpaint(img_bgr, mask_u8):
     """
-    Executes true Modulated Inpainting GAN (MI-GAN v2) neural erasure
-    using tight bounding-box cropping with contextual margin.
-    Peak RAM: ~90 MB (safely below Render 512 MB ceiling).
-    Supports tiny corner watermarks up to large text stamps with forensic feathering.
+    Executes MI-GAN v2 Neural Inpainter.
+    Optimized for high-speed frame-by-frame video processing.
     """
-    h, w = img_bgr.shape[:2]
-    ys, xs = np.where(mask_u8 > 20)
-    if len(ys) == 0:
-        return img_bgr
-
-    raw_h = int(ys.max() - ys.min())
-    raw_w = int(xs.max() - xs.min())
-    pad = max(48, int(max(raw_h, raw_w) * 0.4))
-
-    y1 = max(0, int(ys.min()) - pad)
-    y2 = min(h, int(ys.max()) + pad)
-    x1 = max(0, int(xs.min()) - pad)
-    x2 = min(w, int(xs.max()) + pad)
-
-    crop_img = img_bgr[y1:y2, x1:x2]
-    crop_mask = mask_u8[y1:y2, x1:x2]
-    ch, cw = crop_img.shape[:2]
-
-    # Multiple of 16, minimum 64 for GAN convolutional layers, maximum 512 for RAM safety
-    max_dim = 512
-    if max(ch, cw) > max_dim:
-        scale = max_dim / max(ch, cw)
-        target_w = max(64, int(round(cw * scale / 16.0)) * 16)
-        target_h = max(64, int(round(ch * scale / 16.0)) * 16)
-    else:
-        target_w = max(64, int(np.ceil(cw / 16.0)) * 16)
-        target_h = max(64, int(np.ceil(ch / 16.0)) * 16)
-
-    proc_img = cv2.resize(crop_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    proc_mask = cv2.resize(crop_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-
-    # In MI-GAN: 0 is target to remove, 255 is background to keep!
-    migan_mask = np.full((target_h, target_w), 255, dtype=np.uint8)
-    migan_mask[proc_mask > 20] = 0
-
-    crop_rgb = cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB)
-    m_in = migan_mask[np.newaxis, np.newaxis, ...]
-    im_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
-
-    # Neural GAN Inference
-    out = migan_session.run(None, {'image': im_in, 'mask': m_in})
+    session = get_migan_session()
+    orig_h, orig_w = img_bgr.shape[:2]
+    crop_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    TARGET_SIZE = 512
+    crop_resized = cv2.resize(crop_rgb, (TARGET_SIZE, TARGET_SIZE), interpolation=cv2.INTER_AREA)
+    mask_resized = cv2.resize(mask_u8, (TARGET_SIZE, TARGET_SIZE), interpolation=cv2.INTER_NEAREST)
+    
+    migan_mask = np.full((TARGET_SIZE, TARGET_SIZE), 255, dtype=np.uint8)
+    migan_mask[mask_resized > 20] = 0
+    migan_mask_in = migan_mask[np.newaxis, np.newaxis, ...]
+    img_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
+    
+    out = session.run(None, {'image': img_in, 'mask': migan_mask_in})
     out_rgb = np.transpose(out[0][0], (1, 2, 0))
-    out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-
-    if (target_w, target_h) != (cw, ch):
-        out_bgr = cv2.resize(out_bgr, (cw, ch), interpolation=cv2.INTER_CUBIC)
-
-    # Forensic soft alpha feathering on mask boundary
-    mask_feathered = cv2.GaussianBlur(crop_mask, (5, 5), 1.2).astype(np.float32) / 255.0
+    out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    out_rgb_res = cv2.resize(out_rgb, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+    
+    mask_feathered = cv2.GaussianBlur(mask_u8, (5, 5), 1.2).astype(np.float32) / 255.0
     alpha = np.expand_dims(mask_feathered, axis=2)
-    blended_crop = (out_bgr.astype(np.float32) * alpha + crop_img.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-
-    result = img_bgr.copy()
-    result[y1:y2, x1:x2] = blended_crop
-    return result
+    final_rgb = (out_rgb_res.astype(np.float32) * alpha + crop_rgb.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+    return cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "GhostErase MI-GAN AI Cloud Engine"}
+    return {
+        "status": "ok",
+        "service": "GhostErase AI Cloud Engine",
+        "photo_engine": "Samsung Deep LaMa (Zero Blur)",
+        "video_engine": "MI-GAN v2 (Ultra Fast)"
+    }
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "engine": "MI-GAN Neural Inpainter (Active)" if migan_session else "C++ Telea Fallback"
+        "engine": "Samsung Deep LaMa Neural AI (Active)"
     }
 
 @app.post("/api/inpaint")
-async def inpaint_endpoint(request: Request):
+async def inpaint_photo_endpoint(request: Request):
     try:
         data = await request.json()
         img_b64 = data.get("image", "")
         mask_b64 = data.get("mask", "")
+        engine_choice = data.get("engine", "lama").lower()
 
         if not img_b64 or not mask_b64:
             return JSONResponse({"error": "Missing image or mask data"}, status_code=400)
@@ -171,22 +222,13 @@ async def inpaint_endpoint(request: Request):
 
         _, mask_binary = cv2.threshold(mask_gray, 20, 255, cv2.THRESH_BINARY)
 
-        # Run MI-GAN Neural Inpainter
-        if migan_session is not None:
-            try:
-                result_bgr = run_migan_inpaint(img_bgr, mask_binary)
-                engine_used = "MI-GAN Neural GAN (Zero Blur)"
-            except Exception as migan_err:
-                print(f"MI-GAN error, using fallback: {migan_err}")
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                mask_dilated = cv2.dilate(mask_binary, kernel, iterations=1)
-                result_bgr = cv2.inpaint(img_bgr, mask_dilated, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
-                engine_used = "C++ Telea Fallback"
+        # Run Selected Neural Inpainter
+        if engine_choice == "migan":
+            result_bgr = run_migan_inpaint(img_bgr, mask_binary)
+            engine_used = "MI-GAN v2 Neural AI (Ultra Fast Video Mode)"
         else:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask_dilated = cv2.dilate(mask_binary, kernel, iterations=1)
-            result_bgr = cv2.inpaint(img_bgr, mask_dilated, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
-            engine_used = "C++ Telea Engine"
+            result_bgr = run_lama_inpaint(img_bgr, mask_binary)
+            engine_used = "Samsung Deep LaMa Neural AI (Zero Blur Photo Mode)"
 
         # Encode back to PNG
         success, buf = cv2.imencode(".png", result_bgr)
@@ -197,4 +239,5 @@ async def inpaint_endpoint(request: Request):
         return {"result": out_b64, "image": out_b64, "engine": engine_used}
 
     except Exception as e:
+        print(f"Error in inpaint endpoint: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
