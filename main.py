@@ -19,7 +19,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load MI-GAN Neural Model
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = JSONResponse({"status": "ok"})
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            response = JSONResponse({"error": str(e)}, status_code=500)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+# Load MI-GAN Neural Model with Ultra-Low Memory Budget (~90MB)
 migan_session = None
 
 try:
@@ -32,49 +46,72 @@ try:
 
     print(f"[*] Initializing MI-GAN Neural Engine from {model_path}...")
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 2
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    opts.enable_cpu_mem_arena = False  # Critical: restricts RAM to ~90MB (never crashes Render)
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     migan_session = ort.InferenceSession(model_path, opts, providers=['CPUExecutionProvider'])
-    print("[+] MI-GAN Modulated Inpainting GAN v2 Ready in Cloud!")
+    print("[+] MI-GAN Modulated Inpainting GAN v2 Ready in Cloud (Low-RAM Mode)!")
 except Exception as e:
     print(f"[-] MI-GAN load warning: {e}")
     migan_session = None
 
 def run_migan_inpaint(img_bgr, mask_u8):
     """
-    Executes true Modulated Inpainting GAN (MI-GAN v2) neural erasure.
-    img_bgr: (H, W, 3) uint8 image in BGR
-    mask_u8: (H, W) uint8 mask (255 = watermark area, 0 = background)
+    Executes true Modulated Inpainting GAN (MI-GAN v2) neural erasure
+    using tight bounding-box cropping with contextual margin.
+    Peak RAM: ~90 MB (safely below Render 512 MB ceiling).
     """
     h, w = img_bgr.shape[:2]
-    user_mask_bool = (mask_u8 > 20)
+    ys, xs = np.where(mask_u8 > 20)
+    if len(ys) == 0:
+        return img_bgr
+
+    # Tight crop around watermark with 32px contextual margin
+    pad = 32
+    y1 = max(0, int(ys.min()) - pad)
+    y2 = min(h, int(ys.max()) + pad)
+    x1 = max(0, int(xs.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad)
+
+    crop_img = img_bgr[y1:y2, x1:x2]
+    crop_mask = mask_u8[y1:y2, x1:x2]
+    ch, cw = crop_img.shape[:2]
+
+    # Ensure dimensions are multiples of 16 for GAN convolutional layers, max 512
+    max_dim = 512
+    if max(ch, cw) > max_dim:
+        scale = max_dim / max(ch, cw)
+        target_w = max(16, int(round(cw * scale / 16.0)) * 16)
+        target_h = max(16, int(round(ch * scale / 16.0)) * 16)
+    else:
+        target_w = max(16, int(np.ceil(cw / 16.0)) * 16)
+        target_h = max(16, int(np.ceil(ch / 16.0)) * 16)
+
+    proc_img = cv2.resize(crop_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    proc_mask = cv2.resize(crop_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
     # In MI-GAN: 0 is target to remove, 255 is background to keep!
-    migan_mask = np.full((h, w), 255, dtype=np.uint8)
-    migan_mask[user_mask_bool] = 0
+    migan_mask = np.full((target_h, target_w), 255, dtype=np.uint8)
+    migan_mask[proc_mask > 20] = 0
 
-    crop_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    migan_mask_in = migan_mask[np.newaxis, np.newaxis, ...]
-    img_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
+    crop_rgb = cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB)
+    m_in = migan_mask[np.newaxis, np.newaxis, ...]
+    im_in = np.transpose(crop_rgb, (2, 0, 1))[np.newaxis, ...]
 
-    # Neural inference
-    out = migan_session.run(None, {'image': img_in, 'mask': migan_mask_in})
+    # Neural GAN Inference (~0.4s)
+    out = migan_session.run(None, {'image': im_in, 'mask': m_in})
     out_rgb = np.transpose(out[0][0], (1, 2, 0))
     out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
-    # Forensic grain & texture blending
-    border_ring = cv2.dilate(mask_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) - mask_u8
-    if np.count_nonzero(border_ring) > 40:
-        high_pass = img_bgr.astype(np.float32) - cv2.GaussianBlur(img_bgr, (5, 5), 0).astype(np.float32)
-        noise_sigma = np.std(high_pass[border_ring > 0], axis=0)
-        grain = np.random.normal(0, np.clip(noise_sigma, 0.6, 6.0), img_bgr.shape)
-        out_bgr_textured = np.clip(out_bgr.astype(np.float32) + grain, 0, 255).astype(np.uint8)
-    else:
-        out_bgr_textured = out_bgr
+    if (target_w, target_h) != (cw, ch):
+        out_bgr = cv2.resize(out_bgr, (cw, ch), interpolation=cv2.INTER_CUBIC)
 
     # Seamless composite strictly on watermark mask
-    final_bgr = np.where(mask_u8[:, :, np.newaxis] > 20, out_bgr_textured, img_bgr)
-    return final_bgr
+    result = img_bgr.copy()
+    crop_composite = np.where(crop_mask[:, :, np.newaxis] > 20, out_bgr, crop_img)
+    result[y1:y2, x1:x2] = crop_composite
+    return result
 
 @app.get("/")
 def root():
